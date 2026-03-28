@@ -198,9 +198,17 @@ func (m *Manager) StartACP(ctx context.Context, agentOverride, rigName string) e
 		return fmt.Errorf("ACP Mayor is already running. Only one ACP session is allowed at a time")
 	}
 
-	rc, agentName, err := config.ResolveAgentConfigWithOverride(m.townRoot, "", agentOverride)
-	if err != nil {
-		return fmt.Errorf("resolving agent config: %w", err)
+	var rc *config.RuntimeConfig
+	var agentName string
+	if agentOverride != "" {
+		var err error
+		rc, agentName, err = config.ResolveAgentConfigWithOverride(m.townRoot, "", agentOverride)
+		if err != nil {
+			return fmt.Errorf("resolving agent config: %w", err)
+		}
+	} else {
+		rc = config.ResolveRoleAgentConfig("mayor", m.townRoot, "")
+		agentName = rc.ResolvedAgent
 	}
 
 	if !config.RuntimeConfigSupportsACP(rc) {
