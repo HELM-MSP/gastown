@@ -1245,6 +1245,22 @@ func (d *Daemon) ensureWitnessRunning(rigName string) {
 		return
 	}
 
+	// Event gate: do not spawn a new witness session when there are no polecats
+	// to manage and no pending events. Start() returns ErrAlreadyRunning (cheap) if
+	// session already running. But spawning a NEW session burns API credits for nothing.
+	// Added by HELM-MSP fork to prevent unconditional witness respawning. (helm-patches)
+	if !d.hasPendingEvents("witness") {
+		r := &rig.Rig{
+			Name: rigName,
+			Path: filepath.Join(d.config.TownRoot, rigName),
+		}
+		mgr := witness.NewManager(r)
+		if running, _ := mgr.IsRunning(); !running {
+			d.logger.Printf("No pending witness events and no session running for %s, skipping spawn", rigName)
+			return
+		}
+	}
+
 	// Manager.Start() handles: zombie detection, session creation, env vars, theming,
 	// startup readiness waits, and crucially - startup/propulsion nudges (GUPP).
 	// It returns ErrAlreadyRunning if Claude is already running in tmux.
