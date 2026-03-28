@@ -61,12 +61,13 @@ func init() {
 
 // PatrolScanOutput is the JSON output format for patrol scan results.
 type PatrolScanOutput struct {
-	Rig         string                    `json:"rig"`
-	Timestamp   string                    `json:"timestamp"`
-	Zombies     *PatrolScanZombieOutput   `json:"zombies"`
-	Stalls      *PatrolScanStallOutput    `json:"stalls,omitempty"`
-	Completions *PatrolScanCompleteOutput `json:"completions,omitempty"`
-	Receipts    []witness.PatrolReceipt   `json:"receipts,omitempty"`
+	Rig         string                        `json:"rig"`
+	Timestamp   string                        `json:"timestamp"`
+	Zombies     *PatrolScanZombieOutput       `json:"zombies"`
+	Stalls      *PatrolScanStallOutput        `json:"stalls,omitempty"`
+	Completions *PatrolScanCompleteOutput     `json:"completions,omitempty"`
+	IdleWt      *PatrolScanIdleWorktreeOutput `json:"idle_worktrees,omitempty"`
+	Receipts    []witness.PatrolReceipt       `json:"receipts,omitempty"`
 }
 
 // PatrolScanZombieOutput holds zombie detection results.
@@ -123,6 +124,22 @@ type PatrolScanCompleteItem struct {
 	CompletionTime string `json:"completion_time,omitempty"`
 }
 
+// PatrolScanIdleWorktreeOutput holds idle worktree detection results.
+type PatrolScanIdleWorktreeOutput struct {
+	Checked int                          `json:"checked"`
+	Found   int                          `json:"found"`
+	Idle    []PatrolScanIdleWorktreeItem `json:"idle,omitempty"`
+}
+
+// PatrolScanIdleWorktreeItem is a single idle worktree detection.
+type PatrolScanIdleWorktreeItem struct {
+	Polecat       string `json:"polecat"`
+	LastFileMod   string `json:"last_file_mod"`
+	IdleMinutes   float64 `json:"idle_minutes"`
+	HasHookedWork bool   `json:"has_hooked_work"`
+	Action        string `json:"action"`
+}
+
 func runPatrolScan(cmd *cobra.Command, args []string) error {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
@@ -148,13 +165,14 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 
 	timestamp := time.Now().UTC().Format(time.RFC3339)
 
-	// Run all three detection passes.
+	// Run all four detection passes.
 	// Note: DetectZombiePolecats takes a router param but does NOT send mail
 	// internally — it only uses the router for workspace context. Notifications
 	// are sent exclusively below via --notify, avoiding double-send.
 	zombieResult := witness.DetectZombiePolecats(bd, workDir, rigName, router)
 	stallResult := witness.DetectStalledPolecats(workDir, rigName)
 	completionResult := witness.DiscoverCompletions(bd, workDir, rigName, router)
+	idleWtResult := witness.DetectIdleWorktrees(workDir, rigName)
 
 	// Build patrol receipts for zombies
 	receipts := witness.BuildPatrolReceipts(rigName, zombieResult)
@@ -169,10 +187,10 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	}
 
 	if patrolScanJSON {
-		return outputPatrolScanJSON(rigName, timestamp, zombieResult, stallResult, completionResult, receipts)
+		return outputPatrolScanJSON(rigName, timestamp, zombieResult, stallResult, completionResult, idleWtResult, receipts)
 	}
 
-	return outputPatrolScanHuman(rigName, zombieResult, stallResult, completionResult, receipts)
+	return outputPatrolScanHuman(rigName, zombieResult, stallResult, completionResult, idleWtResult, receipts)
 }
 
 func countActiveWorkZombies(result *witness.DetectZombiePolecatsResult) int {
@@ -214,7 +232,7 @@ func sendZombieNotification(router *mail.Router, rigName string, result *witness
 	_ = router.Send(msg)
 }
 
-func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, receipts []witness.PatrolReceipt) error {
+func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, idleWtResult *witness.DetectIdleWorktreesResult, receipts []witness.PatrolReceipt) error {
 	output := PatrolScanOutput{
 		Rig:       rigName,
 		Timestamp: timestamp,
@@ -290,12 +308,30 @@ func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.Detec
 		output.Completions = co
 	}
 
+	// Idle worktrees
+	if idleWtResult != nil && len(idleWtResult.Idle) > 0 {
+		iwo := &PatrolScanIdleWorktreeOutput{
+			Checked: idleWtResult.Checked,
+			Found:   len(idleWtResult.Idle),
+		}
+		for _, iw := range idleWtResult.Idle {
+			iwo.Idle = append(iwo.Idle, PatrolScanIdleWorktreeItem{
+				Polecat:       iw.PolecatName,
+				LastFileMod:   iw.LastFileMod.UTC().Format(time.RFC3339),
+				IdleMinutes:   iw.IdleDuration.Minutes(),
+				HasHookedWork: iw.HasHookedWork,
+				Action:        iw.Action,
+			})
+		}
+		output.IdleWt = iwo
+	}
+
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(output)
 }
 
-func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, _ []witness.PatrolReceipt) error {
+func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, idleWtResult *witness.DetectIdleWorktreesResult, _ []witness.PatrolReceipt) error {
 	fmt.Printf("%s Patrol scan: %s\n\n", style.Bold.Render("🔍"), rigName)
 
 	// Zombies
@@ -381,6 +417,30 @@ func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePol
 		fmt.Println()
 	}
 
+	// Idle worktrees
+	if idleWtResult != nil && (len(idleWtResult.Idle) > 0 || patrolScanVerbose) {
+		fmt.Printf("%s Idle Worktree Detection: checked %d polecat(s)\n",
+			style.Bold.Render("📂"), idleWtResult.Checked)
+
+		if len(idleWtResult.Idle) == 0 {
+			fmt.Printf("  %s\n", style.Dim.Render("No idle worktrees detected"))
+		} else {
+			for _, iw := range idleWtResult.Idle {
+				icon := "⚠"
+				if iw.HasHookedWork && iw.Action == "escalated" {
+					icon = "🚨"
+				}
+				fmt.Printf("  %s %s: no file changes for %.0fm (last: %s)\n",
+					icon, iw.PolecatName, iw.IdleDuration.Minutes(),
+					iw.LastFileMod.UTC().Format("15:04:05 UTC"))
+				if iw.HasHookedWork {
+					fmt.Printf("    Hooked work: yes → %s\n", iw.Action)
+				}
+			}
+		}
+		fmt.Println()
+	}
+
 	// Summary
 	zombieCount := 0
 	activeCount := 0
@@ -396,12 +456,16 @@ func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePol
 	if completionResult != nil {
 		completionCount = len(completionResult.Discovered)
 	}
+	idleWtCount := 0
+	if idleWtResult != nil {
+		idleWtCount = len(idleWtResult.Idle)
+	}
 
-	if zombieCount == 0 && stallCount == 0 && completionCount == 0 {
+	if zombieCount == 0 && stallCount == 0 && completionCount == 0 && idleWtCount == 0 {
 		fmt.Printf("%s All clear — no issues detected\n", style.Success.Render("✓"))
 	} else {
-		fmt.Printf("Summary: %d zombie(s) (%d active-work), %d stall(s), %d completion(s)\n",
-			zombieCount, activeCount, stallCount, completionCount)
+		fmt.Printf("Summary: %d zombie(s) (%d active-work), %d stall(s), %d completion(s), %d idle worktree(s)\n",
+			zombieCount, activeCount, stallCount, completionCount, idleWtCount)
 	}
 
 	return nil

@@ -369,6 +369,18 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 		// Proxy / network
 		"HTTP_PROXY",
 		"HTTPS_PROXY",
+
+		// Zhipu AI (Z.ai GLM models)
+		"ZHIPUAI_API_KEY",
+
+		// MiniMax
+		"MINIMAX_API_KEY",
+
+		// Groq
+		"GROQ_API_KEY",
+
+		// OpenRouter
+		"OPENROUTER_API_KEY",
 		"NO_PROXY",
 
 		// mTLS
