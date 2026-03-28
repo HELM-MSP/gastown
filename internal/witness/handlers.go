@@ -2703,3 +2703,148 @@ func getAgentActiveMR(bd *BdCli, workDir, agentBeadID string) string {
 	}
 	return issues[0].ActiveMR
 }
+
+// IdleWorktreeResult describes a polecat whose worktree shows no file changes
+// for an extended period, suggesting the agent may be stuck or idle.
+type IdleWorktreeResult struct {
+	PolecatName   string
+	LastFileMod   time.Time
+	IdleDuration  time.Duration
+	HasHookedWork bool
+	Action        string // "escalated", "monitored"
+	Error         error
+}
+
+// DetectIdleWorktreesResult contains results from scanning polecat worktrees
+// for file-change inactivity.
+type DetectIdleWorktreesResult struct {
+	Checked int
+	Idle    []IdleWorktreeResult
+	Errors  []error
+}
+
+// DefaultIdleWorktreeThreshold is the duration of no file changes before a
+// polecat worktree is considered idle. Configurable via operational config.
+const DefaultIdleWorktreeThreshold = 15 * time.Minute
+
+// DetectIdleWorktrees scans polecat worktrees for file-change inactivity.
+// A polecat is flagged when its worktree has had no file modifications for
+// longer than the threshold AND the agent appears idle (no recent heartbeat
+// or stale heartbeat with no tmux activity).
+//
+// This catches agents (especially non-Claude runtimes like opencode) that
+// remain alive but stop making progress — the heartbeat mechanism may not
+// capture tool-call activity for all agent types.
+func DetectIdleWorktrees(workDir, rigName string) *DetectIdleWorktreesResult {
+	result := &DetectIdleWorktreesResult{}
+
+	townRoot, err := workspace.Find(workDir)
+	if err != nil || townRoot == "" {
+		townRoot = workDir
+	}
+
+	polecatsDir := filepath.Join(townRoot, rigName, "polecats")
+	entries, err := os.ReadDir(polecatsDir)
+	if err != nil {
+		return result
+	}
+
+	t := tmux.NewTmux()
+	threshold := DefaultIdleWorktreeThreshold
+	now := time.Now()
+
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+
+		polecatName := entry.Name()
+		sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
+		result.Checked++
+
+		sessionAlive, err := t.HasSession(sessionName)
+		if err != nil || !sessionAlive {
+			continue
+		}
+		if !t.IsAgentAlive(sessionName) {
+			continue
+		}
+
+		polecatPath := filepath.Join(polecatsDir, polecatName)
+		lastMod, err := findMostRecentFileMod(polecatPath)
+		if err != nil {
+			result.Errors = append(result.Errors,
+				fmt.Errorf("scanning worktree %s: %w", polecatName, err))
+			continue
+		}
+
+		idleDuration := now.Sub(lastMod)
+		if idleDuration < threshold {
+			continue
+		}
+
+		agentID := fmt.Sprintf("%s/polecats/%s", rigName, polecatName)
+		b := beads.New(polecatPath)
+		pinnedBeads, beadErr := b.List(beads.ListOptions{
+			Status:   beads.StatusPinned,
+			Assignee: agentID,
+			Priority: -1,
+		})
+		hasHookedWork := beadErr == nil && len(pinnedBeads) > 0
+
+		action := "monitored"
+		if hasHookedWork && idleDuration >= threshold*2 {
+			action = "escalated"
+		}
+
+		result.Idle = append(result.Idle, IdleWorktreeResult{
+			PolecatName:   polecatName,
+			LastFileMod:   lastMod,
+			IdleDuration:  idleDuration,
+			HasHookedWork: hasHookedWork,
+			Action:        action,
+		})
+	}
+
+	return result
+}
+
+// findMostRecentFileMod walks a directory and returns the most recent file
+// modification time. Skips .git, .beads, node_modules, and target directories.
+func findMostRecentFileMod(dir string) (time.Time, error) {
+	var mostRecent time.Time
+
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return filepath.SkipDir
+		}
+
+		name := d.Name()
+		if d.IsDir() {
+			switch name {
+			case ".git", ".beads", "node_modules", "target", ".dolt-data",
+				".claude", ".opencode", "vendor", "__pycache__", ".venv":
+				return filepath.SkipDir
+			}
+			if strings.HasPrefix(name, ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		if info.ModTime().After(mostRecent) {
+			mostRecent = info.ModTime()
+		}
+		return nil
+	})
+
+	if mostRecent.IsZero() {
+		return time.Now(), err
+	}
+	return mostRecent, err
+}
